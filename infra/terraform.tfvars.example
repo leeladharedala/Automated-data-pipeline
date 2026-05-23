@@ -1,0 +1,12 @@
+region                 = "us-east-1"
+env                    = "dev"
+project                = "energy-etl"
+raw_data_bucket_name   = "multi-agent-pipeline-dev-raw-data"
+scripts_bucket_name    = "multi-agent-pipeline-dev-scripts"
+glue_job_name          = "energy-etl-glue-job"
+glue_database_name     = "energy_etl_db"
+glue_iam_role_name     = "energy-etl-glue-role"
+glue_version           = "4.0"
+glue_worker_type       = "G.1X"
+glue_number_of_workers = 2
+log_retention_days     = 30
