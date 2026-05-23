@@ -1,0 +1,158 @@
+name: Deploy Energy ETL Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+concurrency:
+  group: deploy-${{ github.event.inputs.environment || 'dev' }}
+  cancel-in-progress: false
+
+env:
+  TF_WORKING_DIR: infra
+  AWS_REGION: ${{ secrets.AWS_REGION || 'us-east-1' }}
+  GLUE_JOB_NAME: energy-etl-glue-job
+  PYSPARK_SCRIPT_PATH: src/transformations/transform.py
+  ENVIRONMENT: ${{ github.event.inputs.environment || 'dev' }}
+
+jobs:
+  lint:
+    name: Lint & Validate Terraform
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269ef065 # v3.1.2
+        with:
+          terraform_version: "~1.9"
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init -backend-config="key=${{ env.ENVIRONMENT }}/terraform.tfstate" -input=false
+      - name: Terraform Format Check
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform fmt -check -recursive
+      - name: Terraform Validate
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform validate
+
+  plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: lint
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269ef065 # v3.1.2
+        with:
+          terraform_version: "~1.9"
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init -backend-config="key=${{ env.ENVIRONMENT }}/terraform.tfstate" -input=false
+      - name: Terraform Plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform plan -var="environment=${{ env.ENVIRONMENT }}" -var="aws_region=${{ env.AWS_REGION }}" -out=tfplan -input=false
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tfplan-${{ env.ENVIRONMENT }}-${{ github.run_id }}
+          path: ${{ env.TF_WORKING_DIR }}/tfplan
+          retention-days: 30
+          if-no-files-found: error
+
+  apply:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: plan
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269ef065 # v3.1.2
+        with:
+          terraform_version: "~1.9"
+          terraform_wrapper: false
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init -backend-config="key=${{ env.ENVIRONMENT }}/terraform.tfstate" -input=false
+      - name: Download plan artifact
+        uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4.2.1
+        with:
+          name: tfplan-${{ env.ENVIRONMENT }}-${{ github.run_id }}
+          path: ${{ env.TF_WORKING_DIR }}
+      - name: Terraform Apply
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -input=false tfplan
+      - name: Get Glue scripts bucket
+        id: tf_outputs
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          GLUE_SCRIPTS_BUCKET=$(terraform output -raw glue_scripts_bucket 2>/dev/null || echo "")
+          echo "glue_scripts_bucket=${GLUE_SCRIPTS_BUCKET}" >> "$GITHUB_OUTPUT"
+      - name: Upload PySpark script to S3
+        if: steps.tf_outputs.outputs.glue_scripts_bucket != ''
+        run: |
+          aws s3 cp "${{ env.PYSPARK_SCRIPT_PATH }}" \
+            "s3://${{ steps.tf_outputs.outputs.glue_scripts_bucket }}/scripts/transform.py" \
+            --region "${{ env.AWS_REGION }}"
+      - name: Trigger Glue ETL Job
+        run: |
+          JOB_RUN_ID=$(aws glue start-job-run \
+            --job-name "${{ env.GLUE_JOB_NAME }}" \
+            --region "${{ env.AWS_REGION }}" \
+            --query 'JobRunId' --output text)
+          echo "job_run_id=${JOB_RUN_ID}" >> "$GITHUB_ENV"
+      - name: Wait for Glue Job
+        run: |
+          MAX_WAIT=1800; ELAPSED=0; POLL_INTERVAL=30
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            STATUS=$(aws glue get-job-run --job-name "${{ env.GLUE_JOB_NAME }}" --run-id "${{ env.job_run_id }}" --region "${{ env.AWS_REGION }}" --query 'JobRun.JobRunState' --output text)
+            echo "Status: ${STATUS} (${ELAPSED}s)"
+            case "$STATUS" in
+              SUCCEEDED) echo "Job succeeded."; exit 0 ;;
+              FAILED|ERROR|TIMEOUT|STOPPED) echo "::error::Job ended: ${STATUS}"; exit 1 ;;
+              *) sleep $POLL_INTERVAL; ELAPSED=$((ELAPSED + POLL_INTERVAL)) ;;
+            esac
+          done
+          echo "::error::Timed out."; exit 1
