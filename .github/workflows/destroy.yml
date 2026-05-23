@@ -1,0 +1,121 @@
+name: Destroy Energy ETL Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to destroy"
+        required: true
+        type: choice
+        options: [dev, staging, prod]
+      confirmation:
+        description: "Type destroy-<environment> to confirm (e.g. destroy-dev)"
+        required: true
+        type: string
+      remove_state:
+        description: "Also delete remote Terraform state?"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+concurrency:
+  group: deploy-${{ github.event.inputs.environment }}
+  cancel-in-progress: false
+
+env:
+  TF_WORKING_DIR: infra
+  S3_BUCKET: multi-agent-pipeline-dev-raw-data
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  confirm:
+    name: Validate Destroy Confirmation
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - name: Check confirmation string
+        run: |
+          EXPECTED="destroy-${{ github.event.inputs.environment }}"
+          ACTUAL="${{ github.event.inputs.confirmation }}"
+          if [ "${ACTUAL}" != "${EXPECTED}" ]; then
+            echo "ERROR: Expected '${EXPECTED}', got '${ACTUAL}'. Aborting."
+            exit 1
+          fi
+
+  plan-destroy:
+    name: Terraform Destroy Plan
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    needs: confirm
+    environment: ${{ github.event.inputs.environment }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269ef065 # v3.1.2
+        with:
+          terraform_version: "1.8.5"
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ github.event.inputs.environment }}/energy-etl/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ secrets.TF_LOCK_TABLE }}" \
+            -reconfigure
+      - name: Terraform Destroy Plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform plan -destroy \
+            -var="environment=${{ github.event.inputs.environment }}" \
+            -var="aws_region=${{ env.AWS_REGION }}" \
+            -out=tfplan-destroy -input=false
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tfplan-destroy-${{ github.event.inputs.environment }}-${{ github.run_id }}
+          path: ${{ env.TF_WORKING_DIR }}/tfplan-destroy
+          retention-days: 30
+
+  apply-destroy:
+    name: Terraform Apply Destroy
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    needs: plan-destroy
+    environment: ${{ github.event.inputs.environment }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269ef065 # v3.1.2
+        with:
+          terraform_version: "1.8.5"
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=${{ github.event.inputs.environment }}/energy-etl/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ secrets.TF_LOCK_TABLE }}" \
+            -reconfigure
+      - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e # v4.2.1
+        with:
+          name: tfplan-destroy-${{ github.event.inputs.environment }}-${{ github.run_id }}
+          path: ${{ env.TF_WORKING_DIR }}
+      - name: Terraform Apply Destroy
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -input=false tfplan-destroy
