@@ -1,0 +1,128 @@
+name: Deploy Energy ETL Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment (dev, staging, prod)"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+concurrency:
+  group: deploy-${{ github.event.inputs.environment || 'dev' }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  TF_WORKING_DIR: infra
+  PYSPARK_SCRIPT_SRC: src/transformations/transform.py
+  PYSPARK_SCRIPT_S3_URI: s3://multi-agent-pipeline-dev-raw-data/scripts/transform.py
+  GLUE_JOB_NAME: ${{ secrets.GLUE_JOB_NAME }}
+  TF_VAR_environment: ${{ github.event.inputs.environment || 'dev' }}
+
+jobs:
+  lint:
+    name: Lint & Validate Terraform
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269ef065
+        with:
+          terraform_version: "1.9.8"
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init -backend-config="key=${{ env.TF_VAR_environment }}/terraform.tfstate" -backend-config="region=${{ env.AWS_REGION }}" -input=false
+      - name: Terraform Format Check
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform fmt -check -recursive
+      - name: Terraform Validate
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform validate
+
+  plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: lint
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269ef065
+        with:
+          terraform_version: "1.9.8"
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init -backend-config="key=${{ env.TF_VAR_environment }}/terraform.tfstate" -backend-config="region=${{ env.AWS_REGION }}" -input=false
+      - name: Terraform Plan
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform plan -var="environment=${{ env.TF_VAR_environment }}" -out=tfplan -input=false
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: tfplan-${{ env.TF_VAR_environment }}-${{ github.run_id }}
+          path: ${{ env.TF_WORKING_DIR }}/tfplan
+          retention-days: 30
+
+  apply:
+    name: Terraform Apply & Deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: plan
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269ef065
+        with:
+          terraform_version: "1.9.8"
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init -backend-config="key=${{ env.TF_VAR_environment }}/terraform.tfstate" -backend-config="region=${{ env.AWS_REGION }}" -input=false
+      - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e
+        with:
+          name: tfplan-${{ env.TF_VAR_environment }}-${{ github.run_id }}
+          path: ${{ env.TF_WORKING_DIR }}
+      - name: Terraform Apply
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -input=false tfplan
+      - name: Upload PySpark script to S3
+        run: aws s3 cp "${{ env.PYSPARK_SCRIPT_SRC }}" "${{ env.PYSPARK_SCRIPT_S3_URI }}" --region "${{ env.AWS_REGION }}"
+      - name: Trigger Glue job and wait
+        run: |
+          JOB_RUN_ID=$(aws glue start-job-run --job-name "${{ env.GLUE_JOB_NAME }}" --region "${{ env.AWS_REGION }}" --query 'JobRunId' --output text)
+          echo "GLUE_JOB_RUN_ID=$JOB_RUN_ID" >> "$GITHUB_ENV"
+          MAX_WAIT=3600; POLL=30; ELAPSED=0
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            STATUS=$(aws glue get-job-run --job-name "${{ env.GLUE_JOB_NAME }}" --run-id "$JOB_RUN_ID" --region "${{ env.AWS_REGION }}" --query 'JobRun.JobRunState' --output text)
+            echo "[$ELAPSED s] $STATUS"
+            case "$STATUS" in
+              SUCCEEDED) exit 0 ;;
+              FAILED|ERROR|TIMEOUT|STOPPED) echo "Job failed: $STATUS"; exit 1 ;;
+              *) sleep $POLL; ELAPSED=$((ELAPSED+POLL)) ;;
+            esac
+          done
+          echo "Timed out"; exit 1
