@@ -1,0 +1,157 @@
+name: Deploy Energy ETL Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment (e.g. dev, staging, prod)"
+        required: true
+        default: dev
+      trigger_glue_job:
+        description: "Trigger Glue job after deploy? (true/false)"
+        required: false
+        default: "false"
+
+concurrency:
+  group: deploy-${{ github.event.inputs.environment || 'dev' }}
+  cancel-in-progress: false
+
+env:
+  TF_DIR: infra
+  PYSPARK_SCRIPT_LOCAL: src/transformations/transform.py
+  PYSPARK_SCRIPT_S3: s3://multi-agent-pipeline-dev-raw-data/scripts/transform.py
+  GLUE_JOB_NAME: energy-etl-glue-job
+  TF_BACKEND_BUCKET: multi-agent-pipeline-dev-tf-state
+  TF_BACKEND_KEY: energy-etl/terraform.tfstate
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+
+jobs:
+  lint:
+    name: Terraform Lint & Validate
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269ef065
+        with:
+          terraform_version: "1.9.5"
+      - name: Terraform Init
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.TF_BACKEND_BUCKET }}" \
+            -backend-config="key=${{ env.TF_BACKEND_KEY }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -input=false
+      - name: Terraform Format Check
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform fmt -check -recursive
+      - name: Terraform Validate
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform validate
+
+  plan:
+    name: Terraform Plan
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    needs: lint
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269ef065
+        with:
+          terraform_version: "1.9.5"
+      - name: Terraform Init
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.TF_BACKEND_BUCKET }}" \
+            -backend-config="key=${{ env.TF_BACKEND_KEY }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -input=false
+      - name: Terraform Plan
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform plan \
+            -var="environment=${{ github.event.inputs.environment || 'dev' }}" \
+            -var="aws_region=${{ secrets.AWS_REGION }}" \
+            -out=tfplan \
+            -input=false
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: tfplan-deploy-${{ github.run_id }}
+          path: ${{ env.TF_DIR }}/tfplan
+          retention-days: 30
+
+  apply:
+    name: Terraform Apply
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    needs: plan
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269ef065
+        with:
+          terraform_version: "1.9.5"
+      - name: Terraform Init
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.TF_BACKEND_BUCKET }}" \
+            -backend-config="key=${{ env.TF_BACKEND_KEY }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -input=false
+      - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e
+        with:
+          name: tfplan-deploy-${{ github.run_id }}
+          path: ${{ env.TF_DIR }}
+      - name: Terraform Apply
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform apply -input=false tfplan
+      - name: Upload PySpark script to S3
+        run: |
+          aws s3 cp ${{ env.PYSPARK_SCRIPT_LOCAL }} ${{ env.PYSPARK_SCRIPT_S3 }}
+          echo "PySpark script uploaded to ${{ env.PYSPARK_SCRIPT_S3 }}"
+      - name: Trigger Glue Job (optional)
+        if: ${{ github.event.inputs.trigger_glue_job == 'true' }}
+        run: |
+          JOB_RUN_ID=$(aws glue start-job-run \
+            --job-name "${{ env.GLUE_JOB_NAME }}" \
+            --query 'JobRunId' \
+            --output text)
+          echo "Glue job started - JobRunId: $JOB_RUN_ID"
+          echo "GLUE_JOB_RUN_ID=$JOB_RUN_ID" >> "$GITHUB_ENV"
+      - name: Wait for Glue Job completion (optional)
+        if: ${{ github.event.inputs.trigger_glue_job == 'true' }}
+        run: |
+          while true; do
+            STATUS=$(aws glue get-job-run \
+              --job-name "${{ env.GLUE_JOB_NAME }}" \
+              --run-id "${{ env.GLUE_JOB_RUN_ID }}" \
+              --query 'JobRun.JobRunState' \
+              --output text)
+            echo "Current status: $STATUS"
+            case "$STATUS" in
+              SUCCEEDED) echo "Glue job succeeded."; break ;;
+              FAILED|ERROR|TIMEOUT|STOPPED) echo "Glue job failed: $STATUS"; exit 1 ;;
+              *) sleep 30 ;;
+            esac
+          done
