@@ -1,0 +1,114 @@
+name: Destroy Energy ETL Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment to destroy (e.g. dev, staging, prod)"
+        required: true
+        default: dev
+      confirmation:
+        description: "Type 'destroy-<environment>' to confirm (e.g. destroy-dev)"
+        required: true
+
+concurrency:
+  group: deploy-${{ github.event.inputs.environment }}
+  cancel-in-progress: false
+
+env:
+  TF_DIR: infra
+  TF_BACKEND_BUCKET: multi-agent-pipeline-dev-tf-state
+  TF_BACKEND_KEY: energy-etl/terraform.tfstate
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  PYSPARK_SCRIPT_S3_KEY: scripts/transform.py
+  RAW_DATA_BUCKET: multi-agent-pipeline-dev-raw-data
+
+jobs:
+  validate-confirmation:
+    name: Validate Destroy Confirmation
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - name: Check confirmation string
+        run: |
+          EXPECTED="destroy-${{ github.event.inputs.environment }}"
+          ACTUAL="${{ github.event.inputs.confirmation }}"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "Confirmation mismatch. Expected: $EXPECTED, Got: $ACTUAL"
+            exit 1
+          fi
+          echo "Confirmation accepted: $ACTUAL"
+
+  destroy-plan:
+    name: Terraform Destroy Plan
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    needs: validate-confirmation
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269ef065
+        with:
+          terraform_version: "1.9.5"
+      - name: Terraform Init
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.TF_BACKEND_BUCKET }}" \
+            -backend-config="key=${{ env.TF_BACKEND_KEY }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -input=false
+      - name: Terraform Destroy Plan
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform plan \
+            -destroy \
+            -var="environment=${{ github.event.inputs.environment }}" \
+            -var="aws_region=${{ secrets.AWS_REGION }}" \
+            -out=tfplan \
+            -input=false
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: tfplan-destroy-${{ github.run_id }}
+          path: ${{ env.TF_DIR }}/tfplan
+          retention-days: 30
+
+  destroy-apply:
+    name: Terraform Destroy Apply
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    needs: destroy-plan
+    environment: ${{ github.event.inputs.environment }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269ef065
+        with:
+          terraform_version: "1.9.5"
+      - name: Terraform Init
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.TF_BACKEND_BUCKET }}" \
+            -backend-config="key=${{ env.TF_BACKEND_KEY }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -input=false
+      - uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e
+        with:
+          name: tfplan-destroy-${{ github.run_id }}
+          path: ${{ env.TF_DIR }}
+      - name: Terraform Destroy Apply
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform apply -input=false tfplan
+      - name: Remove PySpark script from S3
+        run: aws s3 rm "s3://${{ env.RAW_DATA_BUCKET }}/${{ env.PYSPARK_SCRIPT_S3_KEY }}" || true
+      - name: Remove Terraform state from S3
+        run: aws s3 rm "s3://${{ env.TF_BACKEND_BUCKET }}/${{ env.TF_BACKEND_KEY }}" || true
