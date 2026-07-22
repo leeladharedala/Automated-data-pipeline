@@ -1,0 +1,211 @@
+name: Destroy Glue Pipeline Infra
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment to destroy"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      confirm:
+        description: 'Type "destroy-<environment>" (e.g. destroy-dev) to confirm'
+        required: true
+      empty_state_after_destroy:
+        description: "Remove remote state file after successful destroy?"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  TF_WORKING_DIR: infra/
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  TF_IN_AUTOMATION: "true"
+
+concurrency:
+  group: deploy-${{ github.event.inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  validate-confirmation:
+    name: Validate Confirmation Input
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check confirmation string
+        run: |
+          EXPECTED="destroy-${{ github.event.inputs.environment }}"
+          ACTUAL="${{ github.event.inputs.confirm }}"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "Confirmation string mismatch. Expected '${EXPECTED}', got '${ACTUAL}'."
+            exit 1
+          fi
+          echo "Confirmation validated for environment: ${{ github.event.inputs.environment }}"
+
+  lint:
+    name: Terraform Lint & Validate
+    runs-on: ubuntu-latest
+    needs: validate-confirmation
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: infra/
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@a1502cd9e758c50496cc9ac5308c4843bcd56d36 # v3.0.0
+        with:
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Init (validate-only, no backend lock)
+        run: terraform init -backend=false
+
+      - name: Terraform Validate
+        run: terraform validate
+
+  plan-destroy:
+    name: Terraform Plan Destroy
+    runs-on: ubuntu-latest
+    needs: lint
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: infra/
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@a1502cd9e758c50496cc9ac5308c4843bcd56d36 # v3.0.0
+        with:
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Cache Terraform providers
+        uses: actions/cache@0c45773b623bea8c8e75f6c82b208c3cf94ea4f9 # v4.0.2
+        with:
+          path: infra/.terraform/providers
+          key: ${{ runner.os }}-terraform-providers-${{ hashFiles('infra/.terraform.lock.hcl') }}
+          restore-keys: |
+            ${{ runner.os }}-terraform-providers-
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="key=${{ github.event.inputs.environment }}/terraform.tfstate" \
+            -backend-config="region=${{ secrets.AWS_REGION }}"
+
+      - name: Terraform Plan Destroy
+        run: |
+          terraform plan -destroy \
+            -input=false \
+            -out=tfplan \
+            -var="environment=${{ github.event.inputs.environment }}" \
+            -var="aws_region=${{ secrets.AWS_REGION }}"
+
+      - name: Upload destroy plan artifact
+        uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874 # v4.4.0
+        with:
+          name: tfplan-destroy-${{ github.event.inputs.environment }}-${{ github.run_id }}
+          path: infra/tfplan
+          retention-days: 30
+
+  apply-destroy:
+    name: Terraform Destroy Apply
+    runs-on: ubuntu-latest
+    needs: plan-destroy
+    timeout-minutes: 60
+    environment: ${{ github.event.inputs.environment }}
+    defaults:
+      run:
+        working-directory: infra/
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@a1502cd9e758c50496cc9ac5308c4843bcd56d36 # v3.0.0
+        with:
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Cache Terraform providers
+        uses: actions/cache@0c45773b623bea8c8e75f6c82b208c3cf94ea4f9 # v4.0.2
+        with:
+          path: infra/.terraform/providers
+          key: ${{ runner.os }}-terraform-providers-${{ hashFiles('infra/.terraform.lock.hcl') }}
+          restore-keys: |
+            ${{ runner.os }}-terraform-providers-
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="key=${{ github.event.inputs.environment }}/terraform.tfstate" \
+            -backend-config="region=${{ secrets.AWS_REGION }}"
+
+      - name: Download destroy plan artifact
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: tfplan-destroy-${{ github.event.inputs.environment }}-${{ github.run_id }}
+          path: infra/
+
+      - name: Terraform Apply (Destroy)
+        run: terraform apply -input=false tfplan
+
+      - name: Verify state is empty
+        id: state_check
+        run: |
+          REMAINING=$(terraform state list | wc -l)
+          echo "remaining_resources=${REMAINING}" >> "$GITHUB_OUTPUT"
+          echo "Remaining resources in state: ${REMAINING}"
+
+      - name: Remove remote state file after full destroy
+        if: ${{ github.event.inputs.empty_state_after_destroy == 'true' && steps.state_check.outputs.remaining_resources == '0' }}
+        run: |
+          BUCKET=$(terraform output -raw state_bucket 2>/dev/null || echo "")
+          KEY="${{ github.event.inputs.environment }}/terraform.tfstate"
+          if [ -n "$BUCKET" ]; then
+            echo "Removing state file s3://${BUCKET}/${KEY}"
+            aws s3 rm "s3://${BUCKET}/${KEY}"
+          else
+            echo "No state_bucket output found; skipping state file removal. Remove manually if required."
+          fi
+
+      - name: Cleanup local plan artifacts
+        if: always()
+        run: rm -f infra/tfplan
