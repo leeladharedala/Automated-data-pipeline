@@ -1,0 +1,218 @@
+name: Deploy Data Pipeline
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - infra/**
+      - src/**
+      - .github/workflows/deploy.yml
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+        default: dev
+      aws_region:
+        description: "AWS region"
+        required: false
+        type: string
+        default: us-east-1
+      raw_bucket:
+        description: "S3 bucket containing raw_data/ prefix"
+        required: false
+        type: string
+        default: ""
+      transformed_bucket:
+        description: "S3 bucket containing transformed_data/ prefix"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: data-pipeline-deploy-${{ inputs.environment || 'main' }}
+  cancel-in-progress: false
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  ENVIRONMENT: ${{ inputs.environment || 'dev' }}
+  AWS_REGION: ${{ inputs.aws_region || secrets.AWS_REGION || 'us-east-1' }}
+
+jobs:
+  lint:
+    name: Lint & Validate Terraform
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - name: Checkout
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-data-pipeline-lint
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@a1502cd9e758c50496cc9ac5308c4843bcd56d36 # v3.0.0
+        with:
+          terraform_wrapper: false
+
+      - name: Cache Terraform providers
+        uses: actions/cache@13aacd865c20de90d75de3b17ebe84f7a17d57d2 # v4.0.0
+        with:
+          path: infra/.terraform/providers
+          key: ${{ runner.os }}-terraform-providers-${{ hashFiles('infra/.terraform.lock.hcl') }}
+          restore-keys: |
+            ${{ runner.os }}-terraform-providers-
+
+      - name: Terraform Init (validate only, no backend writes)
+        run: terraform init -backend=false
+
+      - name: Terraform fmt -check
+        run: terraform fmt -check -recursive
+
+      - name: Terraform validate
+        run: terraform validate
+
+  plan:
+    name: Terraform Plan
+    needs: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - name: Checkout
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-data-pipeline-plan
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@a1502cd9e758c50496cc9ac5308c4843bcd56d36 # v3.0.0
+        with:
+          terraform_wrapper: false
+
+      - name: Cache Terraform providers
+        uses: actions/cache@13aacd865c20de90d75de3b17ebe84f7a17d57d2 # v4.0.0
+        with:
+          path: infra/.terraform/providers
+          key: ${{ runner.os }}-terraform-providers-${{ hashFiles('infra/.terraform.lock.hcl') }}
+          restore-keys: |
+            ${{ runner.os }}-terraform-providers-
+
+      - name: Terraform Init (dynamic backend)
+        run: |
+          terraform init \
+            -backend-config="infra/backend-configs/${ENVIRONMENT}.hcl"
+
+      - name: Terraform Plan
+        run: |
+          terraform plan \
+            -input=false \
+            -var="environment=${ENVIRONMENT}" \
+            -var="aws_region=${AWS_REGION}" \
+            -var="raw_bucket=${{ inputs.raw_bucket }}" \
+            -var="transformed_bucket=${{ inputs.transformed_bucket }}" \
+            -out=tfplan
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: tfplan-${{ env.ENVIRONMENT }}-${{ github.run_id }}
+          path: infra/tfplan
+          retention-days: 90
+
+  apply:
+    name: Terraform Apply & Deploy Glue Job
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: ${{ inputs.environment || 'dev' }}
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - name: Checkout
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-data-pipeline-apply
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@a1502cd9e758c50496cc9ac5308c4843bcd56d36 # v3.0.0
+        with:
+          terraform_wrapper: false
+
+      - name: Cache Terraform providers
+        uses: actions/cache@13aacd865c20de90d75de3b17ebe84f7a17d57d2 # v4.0.0
+        with:
+          path: infra/.terraform/providers
+          key: ${{ runner.os }}-terraform-providers-${{ hashFiles('infra/.terraform.lock.hcl') }}
+          restore-keys: |
+            ${{ runner.os }}-terraform-providers-
+
+      - name: Terraform Init (dynamic backend)
+        run: |
+          terraform init \
+            -backend-config="infra/backend-configs/${ENVIRONMENT}.hcl"
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.4
+        with:
+          name: tfplan-${{ env.ENVIRONMENT }}-${{ github.run_id }}
+          path: infra
+
+      - name: Terraform Apply
+        run: terraform apply -input=false tfplan
+
+      - name: Export Terraform outputs
+        id: tf_outputs
+        run: |
+          echo "glue_job_name=$(terraform output -raw glue_job_name)" >> "$GITHUB_OUTPUT"
+          echo "glue_scripts_bucket=$(terraform output -raw glue_scripts_bucket)" >> "$GITHUB_OUTPUT"
+
+      - name: Upload Glue PySpark job script to S3
+        run: |
+          aws s3 cp \
+            src/jobs/transform_raw_to_parquet.py \
+            "s3://${{ steps.tf_outputs.outputs.glue_scripts_bucket }}/scripts/transform_raw_to_parquet.py"
+
+      - name: Update Glue job definition to latest script
+        run: |
+          aws glue update-job \
+            --job-name "${{ steps.tf_outputs.outputs.glue_job_name }}" \
+            --job-update "$(jq -n \
+              --arg script_location "s3://${{ steps.tf_outputs.outputs.glue_scripts_bucket }}/scripts/transform_raw_to_parquet.py" \
+              '{Command: {Name: "glueetl", ScriptLocation: $script_location, PythonVersion: "3"}}')"
+
+      - name: Deployment summary
+        run: |
+          echo "### Deploy Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Environment: ${ENVIRONMENT}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Glue Job: ${{ steps.tf_outputs.outputs.glue_job_name }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Script Location: s3://${{ steps.tf_outputs.outputs.glue_scripts_bucket }}/scripts/transform_raw_to_parquet.py" >> "$GITHUB_STEP_SUMMARY"
