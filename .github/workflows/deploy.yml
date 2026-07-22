@@ -1,0 +1,270 @@
+name: Deploy Glue Pipeline Infra
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      glue_job_name:
+        description: "Glue job name to validate/trigger after apply (leave blank to skip)"
+        required: false
+        default: ""
+      run_glue_job:
+        description: "Trigger a Glue job run after apply?"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  TF_WORKING_DIR: infra/
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  TF_IN_AUTOMATION: "true"
+
+concurrency:
+  group: deploy-${{ github.event.inputs.environment || 'dev' }}
+  cancel-in-progress: false
+
+jobs:
+  lint:
+    name: Terraform Lint & Validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: infra/
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@a1502cd9e758c50496cc9ac5308c4843bcd56d36 # v3.0.0
+        with:
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Terraform Format Check
+        id: fmt
+        run: terraform fmt -check -recursive
+        continue-on-error: false
+
+      - name: Terraform Init (validate-only, no backend lock)
+        run: terraform init -backend=false
+
+      - name: Terraform Validate
+        run: terraform validate
+
+  plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    needs: lint
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: infra/
+    outputs:
+      plan-outcome: ${{ steps.plan.outcome }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@a1502cd9e758c50496cc9ac5308c4843bcd56d36 # v3.0.0
+        with:
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Cache Terraform providers
+        uses: actions/cache@0c45773b623bea8c8e75f6c82b208c3cf94ea4f9 # v4.0.2
+        with:
+          path: infra/.terraform/providers
+          key: ${{ runner.os }}-terraform-providers-${{ hashFiles('infra/.terraform.lock.hcl') }}
+          restore-keys: |
+            ${{ runner.os }}-terraform-providers-
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="key=${{ github.event.inputs.environment || 'dev' }}/terraform.tfstate" \
+            -backend-config="region=${{ secrets.AWS_REGION }}"
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan \
+            -input=false \
+            -out=tfplan \
+            -var="environment=${{ github.event.inputs.environment || 'dev' }}" \
+            -var="aws_region=${{ secrets.AWS_REGION }}"
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874 # v4.4.0
+        with:
+          name: tfplan-${{ github.event.inputs.environment || 'dev' }}-${{ github.run_id }}
+          path: infra/tfplan
+          retention-days: 30
+
+  apply:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    needs: plan
+    timeout-minutes: 20
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    defaults:
+      run:
+        working-directory: infra/
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@a1502cd9e758c50496cc9ac5308c4843bcd56d36 # v3.0.0
+        with:
+          terraform_wrapper: false
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Cache Terraform providers
+        uses: actions/cache@0c45773b623bea8c8e75f6c82b208c3cf94ea4f9 # v4.0.2
+        with:
+          path: infra/.terraform/providers
+          key: ${{ runner.os }}-terraform-providers-${{ hashFiles('infra/.terraform.lock.hcl') }}
+          restore-keys: |
+            ${{ runner.os }}-terraform-providers-
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="key=${{ github.event.inputs.environment || 'dev' }}/terraform.tfstate" \
+            -backend-config="region=${{ secrets.AWS_REGION }}"
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: tfplan-${{ github.event.inputs.environment || 'dev' }}-${{ github.run_id }}
+          path: infra/
+
+      - name: Terraform Apply
+        run: terraform apply -input=false tfplan
+
+      - name: Capture Glue job name output
+        id: tf_outputs
+        run: |
+          JOB_NAME=$(terraform output -raw glue_job_name 2>/dev/null || echo "")
+          echo "glue_job_name=${JOB_NAME}" >> "$GITHUB_OUTPUT"
+
+    outputs:
+      glue_job_name: ${{ steps.tf_outputs.outputs.glue_job_name }}
+
+  validate-glue:
+    name: Validate / Trigger Glue Job
+    runs-on: ubuntu-latest
+    needs: apply
+    timeout-minutes: 30
+    if: ${{ github.event.inputs.run_glue_job == 'true' || github.event_name == 'push' }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Resolve Glue job name
+        id: resolve
+        run: |
+          JOB_NAME="${{ github.event.inputs.glue_job_name }}"
+          if [ -z "$JOB_NAME" ]; then
+            JOB_NAME="${{ needs.apply.outputs.glue_job_name }}"
+          fi
+          if [ -z "$JOB_NAME" ]; then
+            echo "No Glue job name available (input or terraform output). Skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "job_name=${JOB_NAME}" >> "$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Validate Glue job exists
+        if: steps.resolve.outputs.skip == 'false'
+        run: |
+          aws glue get-job --job-name "${{ steps.resolve.outputs.job_name }}" \
+            --region "${{ secrets.AWS_REGION }}" > glue_job_definition.json
+          echo "Glue job '${{ steps.resolve.outputs.job_name }}' found and validated."
+
+      - name: Trigger Glue job run
+        id: start_job
+        if: steps.resolve.outputs.skip == 'false' && (github.event.inputs.run_glue_job == 'true')
+        run: |
+          RUN_ID=$(aws glue start-job-run \
+            --job-name "${{ steps.resolve.outputs.job_name }}" \
+            --region "${{ secrets.AWS_REGION }}" \
+            --query 'JobRunId' --output text)
+          echo "run_id=${RUN_ID}" >> "$GITHUB_OUTPUT"
+          echo "Started Glue job run: ${RUN_ID}"
+
+      - name: Poll Glue job run status
+        if: steps.resolve.outputs.skip == 'false' && (github.event.inputs.run_glue_job == 'true')
+        run: |
+          JOB_NAME="${{ steps.resolve.outputs.job_name }}"
+          RUN_ID="${{ steps.start_job.outputs.run_id }}"
+          STATUS="RUNNING"
+          ATTEMPTS=0
+          MAX_ATTEMPTS=60
+          until [[ "$STATUS" != "RUNNING" && "$STATUS" != "STARTING" ]] || [ "$ATTEMPTS" -ge "$MAX_ATTEMPTS" ]; do
+            sleep 30
+            STATUS=$(aws glue get-job-run \
+              --job-name "$JOB_NAME" \
+              --run-id "$RUN_ID" \
+              --region "${{ secrets.AWS_REGION }}" \
+              --query 'JobRun.JobRunState' --output text)
+            echo "Current status: $STATUS"
+            ATTEMPTS=$((ATTEMPTS+1))
+          done
+
+          if [[ "$STATUS" == "SUCCEEDED" ]]; then
+            echo "Glue job run succeeded."
+          else
+            echo "Glue job run ended with status: $STATUS"
+            exit 1
+          fi
+
+      - name: Upload Glue job definition artifact
+        if: steps.resolve.outputs.skip == 'false'
+        uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874 # v4.4.0
+        with:
+          name: glue-job-definition-${{ github.run_id }}
+          path: glue_job_definition.json
+          retention-days: 30
