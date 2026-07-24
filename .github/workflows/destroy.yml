@@ -1,0 +1,178 @@
+name: Destroy Data Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment to destroy"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      aws_region:
+        description: "AWS region"
+        required: false
+        default: "us-east-1"
+        type: string
+      confirmation:
+        description: 'Type "destroy-<environment>" (e.g. destroy-dev) to confirm'
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-${{ github.event.inputs.environment }}
+  cancel-in-progress: false
+
+env:
+  TF_WORKING_DIR: infra
+  TF_VERSION: "1.7.5"
+  ENVIRONMENT: ${{ github.event.inputs.environment }}
+  AWS_REGION: ${{ github.event.inputs.aws_region || secrets.AWS_REGION || 'us-east-1' }}
+  RAW_BUCKET: multi-agent-pipeline-${{ github.event.inputs.environment }}-raw-data
+
+jobs:
+  validate-confirmation:
+    name: Validate Confirmation Input
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check confirmation string matches expected pattern
+        run: |
+          EXPECTED="destroy-${ENVIRONMENT}"
+          PROVIDED="${{ github.event.inputs.confirmation }}"
+          if [ "$PROVIDED" != "$EXPECTED" ]; then
+            echo "::error::Confirmation input '$PROVIDED' does not match required '$EXPECTED'. Aborting destroy."
+            exit 1
+          fi
+          echo "Confirmation validated. Proceeding with destroy of '${ENVIRONMENT}'."
+
+      - name: Extra guard for production
+        if: env.ENVIRONMENT == 'prod'
+        run: |
+          echo "::warning::Destroying PRODUCTION environment. Ensure this was intentional and approved."
+
+  plan-destroy:
+    name: Terraform Destroy Plan
+    runs-on: ubuntu-latest
+    needs: validate-confirmation
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: ${{ env.TF_WORKING_DIR }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-destroy-plan-${{ github.run_id }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@a1502cd9e758c50496cc9ac5308c4843bcd56d36 # v3.0.0
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Cache Terraform providers
+        uses: actions/cache@0c45773b623bea8c8e75f6c82b208c3cf94ea4f9 # v4.0.2
+        with:
+          path: ${{ env.TF_WORKING_DIR }}/.terraform/providers
+          key: ${{ runner.os }}-terraform-providers-${{ env.ENVIRONMENT }}-${{ hashFiles(format('{0}/.terraform.lock.hcl', env.TF_WORKING_DIR)) }}
+          restore-keys: |
+            ${{ runner.os }}-terraform-providers-${{ env.ENVIRONMENT }}-
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="backend-configs/${ENVIRONMENT}.tfbackend"
+
+      - name: Terraform Plan (destroy)
+        run: |
+          terraform plan -destroy \
+            -var="environment=${ENVIRONMENT}" \
+            -var="aws_region=${AWS_REGION}" \
+            -var-file="tfvars/${ENVIRONMENT}.tfvars" \
+            -out=tfplan
+
+      - name: Upload destroy plan artifact
+        uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35d96d4a # v4.4.0
+        with:
+          name: tfplan-destroy-${{ env.ENVIRONMENT }}-${{ github.run_id }}
+          path: ${{ env.TF_WORKING_DIR }}/tfplan
+          retention-days: 90
+
+  apply-destroy:
+    name: Terraform Destroy Apply
+    runs-on: ubuntu-latest
+    needs: plan-destroy
+    timeout-minutes: 45
+    environment: ${{ github.event.inputs.environment }}
+    defaults:
+      run:
+        working-directory: ${{ env.TF_WORKING_DIR }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-destroy-apply-${{ github.run_id }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@a1502cd9e758c50496cc9ac5308c4843bcd56d36 # v3.0.0
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Cache Terraform providers
+        uses: actions/cache@0c45773b623bea8c8e75f6c82b208c3cf94ea4f9 # v4.0.2
+        with:
+          path: ${{ env.TF_WORKING_DIR }}/.terraform/providers
+          key: ${{ runner.os }}-terraform-providers-${{ env.ENVIRONMENT }}-${{ hashFiles(format('{0}/.terraform.lock.hcl', env.TF_WORKING_DIR)) }}
+          restore-keys: |
+            ${{ runner.os }}-terraform-providers-${{ env.ENVIRONMENT }}-
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="backend-configs/${ENVIRONMENT}.tfbackend"
+
+      - name: Download destroy plan artifact
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.7
+        with:
+          name: tfplan-destroy-${{ env.ENVIRONMENT }}-${{ github.run_id }}
+          path: ${{ env.TF_WORKING_DIR }}
+
+      - name: Terraform Apply (destroy)
+        run: terraform apply tfplan
+
+      - name: Verify no remaining managed resources
+        id: check_state
+        run: |
+          REMAINING=$(terraform state list | wc -l)
+          echo "remaining=$REMAINING" >> "$GITHUB_OUTPUT"
+          echo "Remaining resources in state: $REMAINING"
+
+      - name: Clean up Terraform state (fully destroyed only)
+        if: steps.check_state.outputs.remaining == '0'
+        run: |
+          echo "No resources remain in state. Removing local state artifacts."
+          rm -f terraform.tfstate terraform.tfstate.backup
+          rm -rf .terraform
+          echo "State cleanup complete for environment '${ENVIRONMENT}'."
+
+      - name: Warn if resources remain
+        if: steps.check_state.outputs.remaining != '0'
+        run: |
+          echo "::warning::${{ steps.check_state.outputs.remaining }} resource(s) still present in Terraform state. Skipping state cleanup."
