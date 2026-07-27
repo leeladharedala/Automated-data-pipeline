@@ -1,0 +1,189 @@
+name: Destroy Data Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment to destroy"
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+        default: dev
+      aws_region:
+        description: "AWS region"
+        required: false
+        type: string
+        default: "us-east-1"
+      confirmation:
+        description: 'Type "destroy-<environment>" (e.g. destroy-dev) to confirm'
+        required: true
+        type: string
+      remove_state:
+        description: "Remove remote Terraform state after successful destroy"
+        required: false
+        type: boolean
+        default: false
+
+env:
+  TF_WORKING_DIR: infra
+  AWS_REGION: ${{ inputs.aws_region || 'us-east-1' }}
+  ENVIRONMENT: ${{ inputs.environment }}
+
+concurrency:
+  group: deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  validate-confirmation:
+    name: Validate Confirmation Input
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check confirmation string
+        run: |
+          EXPECTED="destroy-${{ inputs.environment }}"
+          if [ "${{ inputs.confirmation }}" != "$EXPECTED" ]; then
+            echo "::error::Confirmation string did not match. Expected '$EXPECTED', got '${{ inputs.confirmation }}'."
+            exit 1
+          fi
+          echo "Confirmation validated for environment '${{ inputs.environment }}'."
+
+  plan-destroy:
+    name: Terraform Plan Destroy
+    needs: validate-confirmation
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@ececac1a45f3b08a01d2dd070d28d111c5fe6722 # v4.1.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-destroy-plan-${{ env.ENVIRONMENT }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: "1.9.8"
+
+      - name: Cache Terraform providers
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: |
+            ${{ env.TF_WORKING_DIR }}/.terraform/providers
+          key: terraform-providers-${{ runner.os }}-${{ env.ENVIRONMENT }}-${{ hashFiles(format('{0}/.terraform.lock.hcl', env.TF_WORKING_DIR)) }}
+          restore-keys: |
+            terraform-providers-${{ runner.os }}-${{ env.ENVIRONMENT }}-
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init \
+            -backend-config="backend-configs/${{ env.ENVIRONMENT }}.hcl" \
+            -input=false
+
+      - name: Terraform Plan Destroy
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform plan -destroy \
+            -input=false \
+            -var="environment=${{ env.ENVIRONMENT }}" \
+            -var="aws_region=${{ env.AWS_REGION }}" \
+            -out=tfplan
+
+      - name: Upload destroy plan artifact
+        uses: actions/upload-artifact@6f51ac03b9356f520e9adb1b1b7802705f340c2b # v4.5.0
+        with:
+          name: tfplan-destroy-${{ env.ENVIRONMENT }}
+          path: ${{ env.TF_WORKING_DIR }}/tfplan
+          retention-days: 30
+
+  apply-destroy:
+    name: Terraform Apply Destroy
+    needs: plan-destroy
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@ececac1a45f3b08a01d2dd070d28d111c5fe6722 # v4.1.0
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-destroy-apply-${{ env.ENVIRONMENT }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: "1.9.8"
+
+      - name: Cache Terraform providers
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: |
+            ${{ env.TF_WORKING_DIR }}/.terraform/providers
+          key: terraform-providers-${{ runner.os }}-${{ env.ENVIRONMENT }}-${{ hashFiles(format('{0}/.terraform.lock.hcl', env.TF_WORKING_DIR)) }}
+          restore-keys: |
+            terraform-providers-${{ runner.os }}-${{ env.ENVIRONMENT }}-
+
+      - name: Terraform Init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          terraform init \
+            -backend-config="backend-configs/${{ env.ENVIRONMENT }}.hcl" \
+            -input=false
+
+      - name: Download destroy plan artifact
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: tfplan-destroy-${{ env.ENVIRONMENT }}
+          path: ${{ env.TF_WORKING_DIR }}
+
+      - name: Terraform Apply Destroy
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -input=false tfplan
+
+      - name: Verify destruction
+        id: verify
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          REMAINING=$(terraform state list | wc -l)
+          echo "remaining_resources=$REMAINING" >> "$GITHUB_OUTPUT"
+          echo "Remaining resources in state: $REMAINING"
+
+      - name: Remove Terraform state (fully destroyed)
+        if: ${{ inputs.remove_state == true && steps.verify.outputs.remaining_resources == '0' }}
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          echo "All resources destroyed. Removing remote state for ${{ env.ENVIRONMENT }}."
+          terraform state pull > "pre-delete-state-${{ env.ENVIRONMENT }}.json.bak"
+          BUCKET=$(grep -E '^\s*bucket' "backend-configs/${{ env.ENVIRONMENT }}.hcl" | cut -d'"' -f2)
+          KEY=$(grep -E '^\s*key' "backend-configs/${{ env.ENVIRONMENT }}.hcl" | cut -d'"' -f2)
+          if [ -n "$BUCKET" ] && [ -n "$KEY" ]; then
+            aws s3 rm "s3://${BUCKET}/${KEY}" --region "${{ env.AWS_REGION }}"
+            echo "Removed state object s3://${BUCKET}/${KEY}"
+          else
+            echo "Could not determine backend bucket/key; skipping state removal."
+          fi
+
+      - name: Upload pre-delete state backup
+        if: ${{ inputs.remove_state == true && steps.verify.outputs.remaining_resources == '0' }}
+        uses: actions/upload-artifact@6f51ac03b9356f520e9adb1b1b7802705f340c2b # v4.5.0
+        with:
+          name: state-backup-${{ env.ENVIRONMENT }}
+          path: ${{ env.TF_WORKING_DIR }}/pre-delete-state-${{ env.ENVIRONMENT }}.json.bak
+          retention-days: 90
