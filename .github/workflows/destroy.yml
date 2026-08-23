@@ -1,0 +1,122 @@
+name: Destroy Data Pipeline Infrastructure
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment to destroy"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      aws_region:
+        description: "AWS region of the deployed infrastructure"
+        required: false
+        default: "us-east-1"
+        type: string
+      confirm:
+        description: "Type destroy-<environment> to confirm (e.g. destroy-dev)"
+        required: true
+        type: string
+
+env:
+  TF_WORKING_DIR: infra
+  ENVIRONMENT: ${{ github.event.inputs.environment }}
+  AWS_REGION: ${{ github.event.inputs.aws_region || secrets.AWS_REGION }}
+
+concurrency:
+  group: deploy-data-pipeline-${{ github.event.inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  validate-confirmation:
+    name: Validate Confirmation Input
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check confirmation string matches expected value
+        run: |
+          expected="destroy-${{ github.event.inputs.environment }}"
+          provided="${{ github.event.inputs.confirm }}"
+          if [ "${provided}" != "${expected}" ]; then
+            echo "::error::Confirmation input '${provided}' does not match required value '${expected}'. Aborting destroy."
+            exit 1
+          fi
+          echo "Confirmation validated. Proceeding with destroy of '${{ github.event.inputs.environment }}'."
+
+  terraform-destroy:
+    name: Terraform Destroy
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: validate-confirmation
+    environment: ${{ github.event.inputs.environment }}
+    defaults:
+      run:
+        working-directory: ${{ env.TF_WORKING_DIR }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="key=data-pipeline/${{ env.ENVIRONMENT }}/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${{ secrets.TF_LOCK_TABLE }}"
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan (Destroy)
+        run: |
+          terraform plan -destroy \
+            -var="environment=${{ env.ENVIRONMENT }}" \
+            -var="aws_region=${{ env.AWS_REGION }}" \
+            -out=tfplan
+
+      - name: Upload Destroy Plan Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: destroy-tfplan-${{ env.ENVIRONMENT }}-${{ github.run_id }}
+          path: ${{ env.TF_WORKING_DIR }}/tfplan
+          retention-days: 30
+
+      - name: Terraform Apply (Destroy)
+        run: terraform apply tfplan
+
+      - name: Empty S3 data prefixes (raw_data / transformed_data)
+        run: |
+          bucket="${{ secrets.DATA_BUCKET }}"
+          if [ -n "${bucket}" ]; then
+            echo "Emptying raw_data/ and transformed_data/ prefixes in s3://${bucket}"
+            aws s3 rm "s3://${bucket}/raw_data/" --recursive || true
+            aws s3 rm "s3://${bucket}/transformed_data/" --recursive || true
+          else
+            echo "DATA_BUCKET secret not set; skipping S3 prefix cleanup."
+          fi
+
+      - name: Cleanup Terraform state (post full destroy)
+        if: success()
+        run: |
+          echo "Infrastructure destroyed successfully for environment '${{ env.ENVIRONMENT }}'."
+          echo "Removing remote Terraform state object for this environment."
+          aws s3 rm "s3://${{ secrets.TF_STATE_BUCKET }}/data-pipeline/${{ env.ENVIRONMENT }}/terraform.tfstate" || true
+          echo "Removing local plan and state artifacts from runner workspace."
+          rm -f tfplan
+          rm -f terraform.tfstate terraform.tfstate.backup
