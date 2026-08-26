@@ -1,0 +1,287 @@
+name: Deploy Data Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      run_glue_job:
+        description: "Trigger a Glue job run after deployment"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  TF_WORKING_DIR: infra
+  ENVIRONMENT: ${{ github.event.inputs.environment || 'dev' }}
+  GLUE_JOB_NAME: multi-agent-pipeline-${{ github.event.inputs.environment || 'dev' }}-transform-job
+  RAW_BUCKET: multi-agent-pipeline-${{ github.event.inputs.environment || 'dev' }}-raw-data
+  SCRIPT_S3_KEY: scripts/transform_job.py
+
+concurrency:
+  group: deploy-${{ github.event.inputs.environment || 'dev' }}
+  cancel-in-progress: false
+
+jobs:
+  validate-workflows:
+    name: Validate Workflow YAML
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: "3.11"
+
+      - name: Install yamllint and PyYAML
+        run: pip install yamllint PyYAML
+
+      - name: Lint workflow YAML files
+        run: |
+          set -e
+          echo "Running yamllint..."
+          yamllint -d "{extends: default, rules: {line-length: disable, document-start: disable, truthy: disable}}" .github/workflows/*.yml
+
+      - name: Validate YAML syntax (parseability)
+        run: |
+          python - <<'EOF'
+          import sys
+          import yaml
+
+          files = [
+              ".github/workflows/deploy.yml",
+              ".github/workflows/destroy.yml",
+          ]
+          failed = False
+          for f in files:
+              try:
+                  with open(f, "r") as fh:
+                      yaml.safe_load(fh)
+                  print(f"OK: {f}")
+              except Exception as e:
+                  print(f"FAILED: {f}: {e}")
+                  failed = True
+          if failed:
+              sys.exit(1)
+          EOF
+
+  unit-tests:
+    name: Run Data-Eng Unit Tests
+    needs: validate-workflows
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f src/transformations/requirements.txt ]; then pip install -r src/transformations/requirements.txt; fi
+          pip install pytest pyspark
+
+      - name: Run unit tests
+        run: |
+          pytest tests/ -v --junitxml=test-results.xml
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: unit-test-results
+          path: test-results.xml
+          retention-days: 30
+
+  terraform-plan:
+    name: Terraform Plan
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: ${{ env.TF_WORKING_DIR }}
+    outputs:
+      plan-exitcode: ${{ steps.plan.outputs.exitcode }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_wrapper: false
+
+      - name: Cache Terraform providers
+        uses: actions/cache@6849a6489940f00c2f30c0fb92c6274307ccb58a # v4.1.2
+        with:
+          path: |
+            ${{ env.TF_WORKING_DIR }}/.terraform/providers
+          key: terraform-providers-${{ runner.os }}-${{ env.ENVIRONMENT }}-${{ hashFiles(format('{0}/.terraform.lock.hcl', env.TF_WORKING_DIR)) }}
+          restore-keys: |
+            terraform-providers-${{ runner.os }}-${{ env.ENVIRONMENT }}-
+
+      - name: Terraform Init
+        run: |
+          terraform init -input=false \
+            -backend-config="backend-configs/${{ env.ENVIRONMENT }}.hcl"
+
+      - name: Terraform fmt check
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan -input=false -out=tfplan \
+            -var="environment=${{ env.ENVIRONMENT }}" \
+            -var="aws_region=${{ secrets.AWS_REGION }}"
+          echo "exitcode=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: tfplan-${{ env.ENVIRONMENT }}
+          path: ${{ env.TF_WORKING_DIR }}/tfplan
+          retention-days: 90
+
+  terraform-apply:
+    name: Terraform Apply
+    needs: terraform-plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    defaults:
+      run:
+        working-directory: ${{ env.TF_WORKING_DIR }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_wrapper: false
+
+      - name: Cache Terraform providers
+        uses: actions/cache@6849a6489940f00c2f30c0fb92c6274307ccb58a # v4.1.2
+        with:
+          path: |
+            ${{ env.TF_WORKING_DIR }}/.terraform/providers
+          key: terraform-providers-${{ runner.os }}-${{ env.ENVIRONMENT }}-${{ hashFiles(format('{0}/.terraform.lock.hcl', env.TF_WORKING_DIR)) }}
+          restore-keys: |
+            terraform-providers-${{ runner.os }}-${{ env.ENVIRONMENT }}-
+
+      - name: Terraform Init
+        run: |
+          terraform init -input=false \
+            -backend-config="backend-configs/${{ env.ENVIRONMENT }}.hcl"
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: tfplan-${{ env.ENVIRONMENT }}
+          path: ${{ env.TF_WORKING_DIR }}
+
+      - name: Terraform Apply
+        run: terraform apply -input=false tfplan
+
+  deploy-transformation:
+    name: Package & Deploy PySpark Job
+    needs: terraform-apply
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Verify transformation script exists
+        run: |
+          if [ ! -f "src/transformations/transform_job.py" ]; then
+            echo "ERROR: src/transformations/transform_job.py not found"
+            exit 1
+          fi
+
+      - name: Upload PySpark script to S3
+        run: |
+          aws s3 cp src/transformations/transform_job.py \
+            "s3://${{ env.RAW_BUCKET }}/${{ env.SCRIPT_S3_KEY }}" \
+            --only-show-errors
+
+      - name: Upload supporting transformation modules (if any)
+        run: |
+          if [ -d "src/transformations/lib" ]; then
+            aws s3 sync src/transformations/lib \
+              "s3://${{ env.RAW_BUCKET }}/scripts/lib/" \
+              --only-show-errors
+          else
+            echo "No supporting lib/ directory found, skipping."
+          fi
+
+      - name: Update Glue job script location
+        run: |
+          aws glue update-job \
+            --job-name "${{ env.GLUE_JOB_NAME }}" \
+            --job-update "{\"Command\":{\"Name\":\"glueetl\",\"ScriptLocation\":\"s3://${{ env.RAW_BUCKET }}/${{ env.SCRIPT_S3_KEY }}\",\"PythonVersion\":\"3\"}}"
+
+      - name: Trigger Glue job run (optional)
+        if: ${{ github.event.inputs.run_glue_job == 'true' }}
+        run: |
+          echo "Starting Glue job run for ${{ env.GLUE_JOB_NAME }}..."
+          RUN_ID=$(aws glue start-job-run --job-name "${{ env.GLUE_JOB_NAME }}" --query 'JobRunId' --output text)
+          echo "Started Glue job run: $RUN_ID"
+          echo "glue_run_id=$RUN_ID" >> "$GITHUB_ENV"
+
+      - name: Report Glue run status (optional)
+        if: ${{ github.event.inputs.run_glue_job == 'true' }}
+        run: |
+          echo "Triggered Glue job run ID: ${glue_run_id}"
+          echo "Monitor progress in the AWS Glue console or via 'aws glue get-job-run'."
